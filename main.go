@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +16,10 @@ import (
 )
 
 var client *s3.Client
+
+const (
+	MaxKeys = 1000
+)
 
 func getClient() *s3.Client {
 	if client != nil {
@@ -31,19 +36,59 @@ func getClient() *s3.Client {
 	return client
 }
 
-func getBucketKeysAndSize(bucket, prefix string, callback func(page int64, object types.Object)) (int64, int64) {
+type Bucket struct {
+	Name string `json:"name"`
+	Prefix string `json:"prefix"`
+	StartAfter string `json:"start_after"`
+	Size int64 `json:"size"`
+	Keys int64 `json:"keys"`
+	StartTime time.Time `json:"start_time"`
+}
+
+func newBucket(name, prefix string) *Bucket {
+	return &Bucket{
+		Name:       name,
+		Prefix:     prefix,
+		StartAfter: "",
+		Size:       0,
+		Keys:       0,
+		StartTime:  time.Time{},
+	}
+}
+
+func (b *Bucket) getLogFile() string  {
+	return fmt.Sprintf(
+		"s3_%s_%s.log",
+		b.Name,
+		strings.Replace(strings.TrimLeft(b.Prefix, "/"), "/", "_", 1024),
+	)
+}
+
+func (b *Bucket) Log()  {
+	fmt.Printf("\rs2://%s/%s, keys=%d, size=%s, time=%s",
+		b.Name,
+		b.Prefix,
+		b.Keys,
+		bytesToReadable(float64(b.Size)),
+		time.Duration(time.Now().UnixNano()-b.StartTime.UnixNano()).String(),
+	)
+}
+
+func (b *Bucket) FetchObjects(callback func(bucket *Bucket, object types.Object)) error {
+	if b.Name == "" {
+		return errors.New("empty bucket name")
+	}
 	client := getClient()
 	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucket),
-		Prefix: aws.String(prefix),
+		Bucket: aws.String(b.Name),
+		Prefix: aws.String(b.Prefix),
+		MaxKeys: MaxKeys,
 	}
 
-	var startTime = time.Now()
-	var totalSize, totalKeys, page int64
 	for {
 		output, err := client.ListObjectsV2(context.TODO(), input)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		if len(output.Contents) == 0 {
@@ -51,30 +96,22 @@ func getBucketKeysAndSize(bucket, prefix string, callback func(page int64, objec
 		}
 
 		for i, object := range output.Contents {
-			totalKeys++
-			totalSize += object.Size
+			b.Keys++
+			b.Size += object.Size
 			if len(output.Contents)-1 == i {
 				input.StartAfter = object.Key
-
-				page++
-				fmt.Printf("\rs3://%s/%s, keys=%d, size=%s, page=%d, time=%s",
-					bucket,
-					prefix,
-					totalKeys,
-					bytesToReadable(float64(totalSize)),
-					page,
-					time.Duration(time.Now().UnixNano()-startTime.UnixNano()).String(),
-				)
+				b.StartAfter = aws.ToString(object.Key)
+				b.Log()
 			}
 
 			if callback != nil {
-				callback(page, object)
+				callback(b, object)
 			}
 		}
-	}
 
+	}
 	fmt.Println()
-	return totalKeys, totalSize
+	return nil
 }
 
 func bytesToReadable(bytes float64) string {
@@ -110,12 +147,18 @@ func diff(bucket1, bucket2, prefix string) {
 
 	go func() {
 		defer wg.Done()
-		bucket1Keys, bucket1Size = getBucketKeysAndSize(bucket1, prefix, nil)
+		b := newBucket(bucket1, prefix)
+		b.FetchObjects(nil)
+		bucket1Keys = b.Keys
+		bucket1Size = b.Size
 	}()
 
 	go func() {
 		defer wg.Done()
-		bucket2Keys, bucket2Size = getBucketKeysAndSize(bucket2, prefix, nil)
+		b := newBucket(bucket2, prefix)
+		b.FetchObjects(nil)
+		bucket2Size = b.Size
+		bucket2Keys = b.Keys
 	}()
 
 	wg.Wait()
@@ -129,12 +172,14 @@ func diff(bucket1, bucket2, prefix string) {
 func main() {
 	var bucket, prefix string
 	var isDiff = false
+	var resume = false
 	flag.StringVar(&bucket, "bucket", "", "S3 bucket name, Up to two buckets are supported, and multiple buckets are separated by commas")
-	flag.StringVar(&prefix, "prefix", "", "S3 object key prefix, eg. /path/to/some-key")
+	flag.StringVar(&prefix, "prefix", "", "S3 object key prefix, eg. /path/to/some-key, Optional. If it is empty, all objects will be queried.")
 	flag.BoolVar(&isDiff, "diff", false, "Compare whether the key prefix is consistent in the two buckets (by the number and size of keys)")
+	flag.BoolVar(&resume, "resume", false, "Recover from the last stop")
 	flag.Parse()
 
-	if bucket == "" || prefix == "" {
+	if bucket == "" {
 		flag.Usage()
 		return
 	}
@@ -145,6 +190,10 @@ func main() {
 		return
 	}
 
-	getBucketKeysAndSize(buckets[0], prefix, nil)
+	b := newBucket(buckets[0], prefix)
+	err := b.FetchObjects(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 }
